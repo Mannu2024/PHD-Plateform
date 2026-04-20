@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Search, ExternalLink, RefreshCw, Filter, ShieldAlert, Bookmark, MapPin, Calendar, CheckCircle2, ChevronDown, ChevronUp, BellRing, Navigation, GraduationCap, Clock } from "lucide-react";
+import { Search, ExternalLink, RefreshCw, Filter, ShieldAlert, Bookmark, MapPin, Calendar, CheckCircle2, ChevronDown, ChevronUp, BellRing, Navigation, GraduationCap, Clock, X, AlertCircle } from "lucide-react";
 import { differenceInDays, format } from "date-fns";
 import { cn } from "@/lib/utils";
 
@@ -8,12 +8,15 @@ interface Program {
   institute_name: string;
   type: "IIT" | "IIM";
   title: string;
+  academic_year: string;
+  is_expected: boolean;
   department: string;
   research_areas: string[];
   eligibility: string;
   exams_accepted: string[];
   deadline: string | null;
-  status: "open" | "closing_soon" | "closed";
+  expected_deadline: string | null;
+  status: "open" | "closing_soon" | "closed" | "expected";
   url: string;
   fee: string;
   contact: string;
@@ -22,26 +25,55 @@ interface Program {
 }
 
 export default function Home() {
+  const currentYearStr = new Date().getFullYear().toString();
+  const prevYearStr = (new Date().getFullYear() - 1).toString();
+
   const [programs, setPrograms] = useState<Program[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterType, setFilterType] = useState<"All" | "IIT" | "IIM">("All");
-  const [filterStatus, setFilterStatus] = useState<"All" | "open" | "closing_soon" | "closed">("All");
-  const [filterExam, setFilterExam] = useState<string>("All");
+  const [filterStatus, setFilterStatus] = useState<"All" | "open" | "closing_soon" | "closed" | "expected">("All");
+  const [filterYear, setFilterYear] = useState<string>(currentYearStr);
+  
+  const [filterExams, setFilterExams] = useState<string[]>([]);
+  const [filterDepts, setFilterDepts] = useState<string[]>([]);
   
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  
+  // Alert system state
   const [emailAlerts, setEmailAlerts] = useState(false);
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [userEmail, setUserEmail] = useState("");
+  const [submittingEmail, setSubmittingEmail] = useState(false);
 
   useEffect(() => {
     const loadedSaves = localStorage.getItem('savedPhdPrograms');
     if (loadedSaves) {
       setSavedIds(new Set(JSON.parse(loadedSaves)));
     }
+    const savedEmail = localStorage.getItem('phdTrackrEmail');
+    if (savedEmail) {
+      setUserEmail(savedEmail);
+      setEmailAlerts(true);
+    }
     fetchPrograms();
   }, []);
+
+  const syncSubscription = async (emailToSync: string, currentSaved: Set<string>) => {
+    if (!emailToSync) return;
+    try {
+       await fetch("/api/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: emailToSync, saved_programs: Array.from(currentSaved) })
+       });
+    } catch(e) {
+       console.error("Failed to sync subscription", e);
+    }
+  };
 
   const fetchPrograms = async () => {
     setIsRefreshing(true);
@@ -77,22 +109,121 @@ export default function Home() {
     
     setSavedIds(newSaved);
     localStorage.setItem('savedPhdPrograms', JSON.stringify(Array.from(newSaved)));
+    
+    if (emailAlerts && userEmail) {
+      syncSubscription(userEmail, newSaved);
+    }
+  };
+
+  const handleSubscribe = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if(!userEmail.includes("@")) return;
+
+    setSubmittingEmail(true);
+    await syncSubscription(userEmail, savedIds);
+    localStorage.setItem('phdTrackrEmail', userEmail);
+    setEmailAlerts(true);
+    setSubmittingEmail(false);
+    setShowEmailModal(false);
+  };
+
+  const handleToggleAlertsClick = () => {
+    if (emailAlerts) {
+       // Turn off
+       setEmailAlerts(false);
+       setUserEmail("");
+       localStorage.removeItem('phdTrackrEmail');
+       // In a real system, you'd also hit an unsubscribe endpoint here
+    } else {
+       setShowEmailModal(true);
+    }
   };
 
   const uniqueExams = Array.from(new Set(programs.flatMap(p => p.exams_accepted))).sort();
+  const uniqueDepts = Array.from(new Set(programs.map(p => p.department))).sort();
+
+  const handleExamToggle = (exam: string) => {
+    setFilterExams(prev => prev.includes(exam) ? prev.filter(e => e !== exam) : [...prev, exam]);
+  };
+  
+  const handleDeptToggle = (dept: string) => {
+    setFilterDepts(prev => prev.includes(dept) ? prev.filter(d => d !== dept) : [...prev, dept]);
+  };
 
   const filtered = programs.filter(p => {
+    const matchYear = filterYear === "All" || p.academic_year === filterYear;
     const matchType = filterType === "All" || p.type === filterType;
     const matchStatus = filterStatus === "All" || p.status === filterStatus;
-    const matchExam = filterExam === "All" || p.exams_accepted.includes(filterExam);
+    const matchExam = filterExams.length === 0 || p.exams_accepted.some(ex => filterExams.includes(ex));
+    const matchDept = filterDepts.length === 0 || filterDepts.includes(p.department);
     const matchSearch = p.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
                         p.institute_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                         p.department.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchType && matchStatus && matchSearch && matchExam;
+    return matchYear && matchType && matchStatus && matchSearch && matchExam && matchDept;
+  }).sort((a, b) => {
+    // Priority: Current year > Expected > Previous year
+    if (a.academic_year === currentYearStr && b.academic_year !== currentYearStr) return -1;
+    if (b.academic_year === currentYearStr && a.academic_year !== currentYearStr) return 1;
+    
+    // Within same year group, sort by status then deadline
+    const statusWeight = { 'closing_soon': 1, 'open': 2, 'expected': 3, 'closed': 4 };
+    if (statusWeight[a.status] !== statusWeight[b.status]) {
+      return statusWeight[a.status] - statusWeight[b.status];
+    }
+    
+    if (a.deadline && b.deadline) {
+      return new Date(a.deadline).getTime() - new Date(b.deadline).getTime();
+    }
+    return 0;
   });
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col font-sans">
+    <div className="min-h-screen bg-gray-50 flex flex-col font-sans relative">
+      
+      {/* Email Subscription Modal */}
+      {showEmailModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm">
+           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+              <div className="p-6">
+                 <div className="flex justify-between items-start mb-4">
+                    <div className="flex items-center gap-3">
+                       <div className="bg-indigo-100 p-2 rounded-full">
+                         <BellRing className="h-6 w-6 text-indigo-600" />
+                       </div>
+                       <h3 className="text-xl font-bold text-gray-900">Get Deadline Alerts</h3>
+                    </div>
+                    <button onClick={() => setShowEmailModal(false)} className="text-gray-400 hover:text-gray-600 transition-colors">
+                      <X className="h-5 w-5" />
+                    </button>
+                 </div>
+                 <p className="text-gray-600 text-sm mb-6 leading-relaxed">
+                   Enter your email below. We will send you an automatic reminder 3 days and 1 day before the deadline of any program you have saved (bookmarked).
+                 </p>
+                 <form onSubmit={handleSubscribe} className="space-y-4">
+                    <div>
+                      <label className="block text-xs font-bold text-gray-600 uppercase tracking-widest mb-1.5">Email Address</label>
+                      <input 
+                        type="email" 
+                        required
+                        placeholder="e.g. aspirant@example.com"
+                        value={userEmail}
+                        onChange={e => setUserEmail(e.target.value)}
+                        className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:bg-white outline-none transition-all"
+                      />
+                    </div>
+                    <button 
+                      type="submit"
+                      disabled={submittingEmail}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2"
+                    >
+                      {submittingEmail ? <RefreshCw className="h-5 w-5 animate-spin" /> : "Subscribe & Turn On Alerts"}
+                    </button>
+                 </form>
+              </div>
+           </div>
+        </div>
+      )}
+
       {/* Navbar Spotlight */}
       <header className="bg-indigo-900 border-b border-indigo-800 text-white sticky top-0 z-20 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col sm:flex-row justify-between items-center gap-4">
@@ -108,16 +239,16 @@ export default function Home() {
           
           <div className="flex items-center gap-3 w-full sm:w-auto">
              <button 
-               onClick={() => setEmailAlerts(!emailAlerts)}
+               onClick={handleToggleAlertsClick}
                className={cn(
-                 "flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all",
+                 "flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all border",
                  emailAlerts 
-                   ? "bg-emerald-500/20 border border-emerald-500/50 text-emerald-300" 
-                   : "bg-white/10 hover:bg-white/20 text-indigo-100 border border-transparent"
+                   ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-300" 
+                   : "bg-white/10 hover:bg-white/20 text-indigo-100 border-transparent"
                )}
              >
                <BellRing className={cn("h-4 w-4", emailAlerts && "animate-pulse")} />
-               {emailAlerts ? "Alerts On" : "Get Alerts"}
+               {emailAlerts ? "Alerts Active" : "Get Alerts"}
              </button>
              
              <button 
@@ -157,6 +288,27 @@ export default function Home() {
                  </div>
                </div>
 
+               {/* Academic Year */}
+               <div className="mb-6">
+                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Admission Timeline</label>
+                 <div className="flex bg-gray-100 p-1 rounded-lg">
+                   {["All", currentYearStr, prevYearStr].map(year => (
+                     <button 
+                       key={year}
+                       onClick={() => setFilterYear(year)}
+                       className={cn(
+                         "flex-1 py-1.5 rounded-md text-sm font-medium transition-all",
+                         filterYear === year 
+                           ? "bg-white text-gray-900 shadow-sm" 
+                           : "text-gray-500 hover:text-gray-700"
+                       )}
+                     >
+                       {year === currentYearStr ? "Current Year" : year === prevYearStr ? "Previous Year" : "All Admissions"}
+                     </button>
+                   ))}
+                 </div>
+               </div>
+
                {/* Institute Type */}
                <div className="mb-6">
                  <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Institute Details</label>
@@ -186,6 +338,7 @@ export default function Home() {
                      { id: "All", label: "Any Status" },
                      { id: "open", label: "Open Now", color: "bg-emerald-500" },
                      { id: "closing_soon", label: "Closing Soon (≤ 7 days)", color: "bg-amber-500" },
+                     { id: "expected", label: "Expected (Predictive)", color: "bg-indigo-500" },
                      { id: "closed", label: "Closed", color: "bg-rose-500" }
                    ].map(st => (
                      <button
@@ -205,31 +358,66 @@ export default function Home() {
                  </div>
                </div>
 
-               {/* Exam Check */}
-               <div>
-                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Exam Required</label>
-                 <select 
-                   value={filterExam}
-                   onChange={e => setFilterExam(e.target.value)}
-                   className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:bg-white outline-none"
-                 >
-                   <option value="All">All Exams</option>
-                   {uniqueExams.map(ex => (
-                     <option key={ex} value={ex}>{ex}</option>
+               {/* Discipline / Department Checkboxes */}
+               <div className="mb-6">
+                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Departments</label>
+                 <div className="space-y-2.5 max-h-48 overflow-y-auto pr-2 pb-2">
+                   {uniqueDepts.length === 0 && <span className="text-xs text-gray-400">Loading...</span>}
+                   {uniqueDepts.map(dept => (
+                     <label key={dept} className="flex items-start gap-2 cursor-pointer group">
+                       <input 
+                         type="checkbox" 
+                         checked={filterDepts.includes(dept)}
+                         onChange={() => handleDeptToggle(dept)}
+                         className="mt-0.5 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer accent-indigo-600"
+                       />
+                       <span className="text-sm text-gray-700 group-hover:text-indigo-700 leading-snug">{dept}</span>
+                     </label>
                    ))}
-                 </select>
+                 </div>
+               </div>
+
+               {/* Exam Checkboxes */}
+               <div>
+                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Exams Accepted</label>
+                 <div className="space-y-2.5 max-h-48 overflow-y-auto pr-2 pb-2">
+                   {uniqueExams.length === 0 && <span className="text-xs text-gray-400">Loading...</span>}
+                   {uniqueExams.map(ex => (
+                     <label key={ex} className="flex items-start gap-2 cursor-pointer group">
+                       <input 
+                         type="checkbox" 
+                         checked={filterExams.includes(ex)}
+                         onChange={() => handleExamToggle(ex)}
+                         className="mt-0.5 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer accent-indigo-600"
+                       />
+                       <span className="text-sm text-gray-700 group-hover:text-indigo-700 leading-snug">{ex}</span>
+                     </label>
+                   ))}
+                 </div>
                </div>
             </div>
 
             {/* Saved Programs Stat Widget */}
-            <div className="bg-indigo-600 rounded-2xl p-5 text-white shadow-lg shadow-indigo-200 border border-indigo-500">
-               <div className="flex justify-between items-start mb-2">
+            <div className="bg-indigo-600 rounded-2xl p-5 text-white shadow-lg shadow-indigo-200 border border-indigo-500 relative overflow-hidden">
+               <div className="absolute -right-4 -top-4 opacity-10">
+                 <BellRing className="w-24 h-24 text-white" />
+               </div>
+               <div className="flex justify-between items-start mb-2 relative">
                   <Bookmark className="h-5 w-5 text-indigo-200 fill-indigo-200" />
                   <span className="text-2xl font-bold">{savedIds.size}</span>
                </div>
-               <h4 className="font-semibold text-indigo-50 border-b border-indigo-500/50 pb-2 mb-2">Saved Programs</h4>
-               <p className="text-indigo-200 text-xs leading-relaxed">
-                 You are tracking {savedIds.size} core applications. Turn on alerts to be notified 48 hours before their deadlines.
+               <h4 className="font-semibold text-indigo-50 border-b border-indigo-500/50 pb-2 mb-2 relative">Watchlist</h4>
+               <p className="text-indigo-200 text-xs leading-relaxed relative">
+                 You are tracking {savedIds.size} applications. 
+                 {!emailAlerts ? (
+                    <span className="block mt-2 font-semibold text-indigo-100 cursor-pointer underline hover:text-white" onClick={() => setShowEmailModal(true)}>
+                       Turn on alerts to prevent missing deadlines.
+                    </span>
+                 ) : (
+                    <span className="block mt-2 font-semibold text-emerald-300 flex items-center gap-1">
+                      <CheckCircle2 className="h-3 w-3" /> Alerts are currently active.
+                    </span>
+                 )}
                </p>
             </div>
          </aside>
@@ -277,6 +465,9 @@ export default function Home() {
                    if (program.status === 'closed') {
                      statusStyle = "bg-gray-100 text-gray-700 border-gray-200 opacity-80";
                      statusText = "Closed";
+                   } else if (program.status === 'expected') {
+                     statusStyle = "bg-indigo-100 text-indigo-700 border-indigo-200";
+                     statusText = "Expected";
                    } else if (program.status === 'closing_soon') {
                      statusStyle = "bg-amber-100 text-amber-800 border-amber-200 animate-pulse-slow";
                      statusText = `Closing Soon (${daysLeft} days)`;
@@ -286,8 +477,9 @@ export default function Home() {
 
                    return (
                      <div key={program.id} className={cn(
-                       "bg-white rounded-2xl border transition-all duration-300 overflow-hidden",
-                       isExpanded ? "border-indigo-300 shadow-md" : "border-gray-200 shadow-sm hover:border-gray-300 hover:shadow-md"
+                       "bg-white rounded-2xl border transition-all duration-300 overflow-hidden relative",
+                       isExpanded ? "border-indigo-300 shadow-md" : "border-gray-200 shadow-sm hover:border-gray-300 hover:shadow-md",
+                       program.academic_year === currentYearStr && !program.is_expected ? "border-l-4 border-l-emerald-500" : ""
                      )}>
                        {/* Card Header (Always Visible) */}
                        <div className="p-5 sm:p-6 cursor-pointer select-none" onClick={() => setExpandedId(isExpanded ? null : program.id)}>
@@ -300,9 +492,23 @@ export default function Home() {
                                 )}>
                                   {program.institute_name}
                                 </span>
-                                <span className={cn("px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide uppercase border", statusStyle)}>
+                                <span className={cn("px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide uppercase border flex items-center gap-1.5", statusStyle)}>
+                                  {program.status === 'closing_soon' && <AlertCircle className="h-3.5 w-3.5" />}
                                   {statusText}
                                 </span>
+                                {program.is_expected ? (
+                                   <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider text-indigo-700 bg-indigo-100">
+                                      EXPECTED
+                                   </span>
+                                ) : program.academic_year === currentYearStr ? (
+                                   <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider text-white bg-indigo-600">
+                                      CURRENT YEAR
+                                   </span>
+                                ) : (
+                                   <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider text-gray-600 bg-gray-200">
+                                      PREVIOUS YEAR
+                                   </span>
+                                )}
                              </div>
                              
                              <button 
@@ -317,11 +523,33 @@ export default function Home() {
                             {program.title}
                           </h3>
                           
-                          <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-gray-600 mb-4">
+                          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-gray-600 mb-4">
                              <span className="flex items-center gap-1.5"><Navigation className="h-4 w-4 text-gray-400" /> {program.department}</span>
-                             {program.deadline && (
-                               <span className="flex items-center gap-1.5"><Clock className="h-4 w-4 text-gray-400" /> Deadline: {format(new Date(program.deadline), "dd MMM yyyy")}</span>
-                             )}
+                             
+                             {program.is_expected && program.expected_deadline ? (
+                               <div className="flex items-center gap-2">
+                                 <span className="flex items-center gap-1.5">
+                                   <Calendar className="h-4 w-4 text-indigo-400" /> Est. Timeline: ~{format(new Date(program.expected_deadline), "MMMM yyyy")}
+                                 </span>
+                                 <span className="px-2 py-0.5 rounded text-[11px] font-bold tracking-wide uppercase bg-indigo-50 text-indigo-600 border border-indigo-100">
+                                   Based on Preceding Data
+                                 </span>
+                               </div>
+                             ) : program.deadline ? (
+                               <div className="flex items-center gap-2">
+                                 <span className="flex items-center gap-1.5">
+                                   <Clock className="h-4 w-4 text-gray-400" /> Deadline: {format(new Date(program.deadline), "dd MMM yyyy")}
+                                 </span>
+                                 <span className={cn(
+                                   "px-2 py-0.5 rounded text-[11px] font-bold tracking-wide uppercase",
+                                   program.status === 'closed' ? "bg-rose-100 text-rose-700" :
+                                   (daysLeft !== null && daysLeft <= 7) ? "bg-amber-100 text-amber-700" :
+                                   "bg-emerald-100 text-emerald-700"
+                                 )}>
+                                   {program.status === 'closed' ? "Closed" : `${daysLeft} Days Left`}
+                                 </span>
+                               </div>
+                             ) : null}
                           </div>
                           
                           <div className="flex items-center justify-between border-t border-gray-100 pt-4 mt-2">
@@ -377,6 +605,14 @@ export default function Home() {
                                      <div className="flex items-start justify-between border-t border-gray-100 pt-3">
                                         <div className="text-xs font-medium text-gray-500 uppercase tracking-wide">Contact Details</div>
                                         <div className="text-sm font-semibold text-gray-900 text-right">{program.contact}</div>
+                                     </div>
+                                     <div className="flex items-start justify-between border-t border-gray-100 pt-3">
+                                        <div className="text-xs font-medium text-gray-500 uppercase tracking-wide">Published Date</div>
+                                        <div className="text-sm font-semibold text-gray-900 text-right">{format(new Date(program.published_date), "dd MMM yyyy")}</div>
+                                     </div>
+                                     <div className="flex items-start justify-between border-t border-gray-100 pt-3">
+                                        <div className="text-xs font-medium text-gray-500 uppercase tracking-wide">Last Synced</div>
+                                        <div className="text-sm font-semibold text-gray-900 text-right">{format(new Date(program.fetched_at), "dd MMM yyyy, HH:mm")}</div>
                                      </div>
                                   </div>
                                   
